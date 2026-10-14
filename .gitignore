@@ -8,3 +8,6 @@ subprojects/usrsctp
 subprojects/.wraplock
 
 webui/.next
+
+# Host copies of the runtime configs, seeded on first `docker compose up`
+docker/config/

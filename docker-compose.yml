@@ -1,0 +1,224 @@
+# Open5GS 4G/5G core.
+#
+#   sudo modprobe sctp
+#   docker compose up --build
+#
+# WebUI: http://localhost:9999   admin / 1423
+#
+# The stock configs bind every network function to 127.0.0.x, so the
+# functions share the host network namespace owned by the `net` service.
+# Point a gNB or eNB on this machine at:
+#   AMF NGAP   127.0.0.5:38412/sctp    UPF GTP-U   127.0.0.7:2152/udp
+#   MME S1AP   127.0.0.2:36412/sctp    SGW-U GTP-U 127.0.0.6:2152/udp
+# PLMN 999/70, TAC 1, SST 1, DNN/APN internet, UE pool 10.45.0.0/16.
+#
+# Configs are bind-mounted from the host and are not baked in at runtime:
+#   docker/config/open5gs/*.yaml
+#   docker/config/freeDiameter/*.conf
+# Edit a file, then restart that service, for example:
+#   docker compose restart amf
+# Delete docker/config to restore the image defaults on the next start.
+
+x-nf: &nf
+  image: open5gs:local
+  network_mode: service:net
+  init: true
+  restart: unless-stopped
+  cap_add:
+    - NET_ADMIN
+    - NET_BIND_SERVICE
+  devices:
+    - /dev/net/tun:/dev/net/tun
+  volumes: &config
+    - ./docker/config/open5gs:/etc/open5gs
+    - ./docker/config/freeDiameter:/etc/freeDiameter
+  depends_on:
+    net:
+      condition: service_healthy
+    scp:
+      condition: service_healthy
+
+services:
+  mongodb:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongodb:/data/db
+      - ./docker/runtime/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  webui:
+    build:
+      context: .
+      dockerfile: docker/webui/Dockerfile
+    image: open5gs-webui:local
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    ports:
+      - "9999:9999"
+    environment:
+      DB_URI: mongodb://mongodb/open5gs
+      WAIT_HOSTS: mongodb:27017
+      WAIT_TIMEOUT: "60"
+
+  net:
+    build:
+      context: .
+      dockerfile: docker/runtime/Dockerfile
+    image: open5gs:local
+    init: true
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes: *config
+    healthcheck:
+      test: ["CMD", "ip", "link", "show", "ogstun"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  nrf:
+    <<: *nf
+    command: ["open5gs-run", "open5gs-nrfd"]
+    depends_on:
+      net:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "ss -ltn | grep -q 127.0.0.10:7777"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  scp:
+    <<: *nf
+    command: ["open5gs-run", "open5gs-scpd"]
+    depends_on:
+      nrf:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "ss -ltn | grep -q 127.0.0.200:7777"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  ausf:
+    <<: *nf
+    command: ["open5gs-run", "open5gs-ausfd"]
+
+  udm:
+    <<: *nf
+    command: ["open5gs-run", "open5gs-udmd"]
+
+  udr:
+    <<: *nf
+    command: ["open5gs-run", "open5gs-udrd"]
+    depends_on:
+      net:
+        condition: service_healthy
+      scp:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+
+  pcf:
+    <<: *nf
+    command: ["open5gs-run", "open5gs-pcfd"]
+    depends_on:
+      net:
+        condition: service_healthy
+      scp:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+
+  nssf:
+    <<: *nf
+    command: ["open5gs-run", "open5gs-nssfd"]
+
+  bsf:
+    <<: *nf
+    command: ["open5gs-run", "open5gs-bsfd"]
+
+  upf:
+    <<: *nf
+    command: ["open5gs-run", "open5gs-upfd"]
+    depends_on:
+      net:
+        condition: service_healthy
+
+  sgwu:
+    <<: *nf
+    command: ["open5gs-run", "open5gs-sgwud"]
+    depends_on:
+      net:
+        condition: service_healthy
+
+  smf:
+    <<: *nf
+    command: ["open5gs-run", "open5gs-smfd"]
+    depends_on:
+      net:
+        condition: service_healthy
+      scp:
+        condition: service_healthy
+      upf:
+        condition: service_started
+
+  sgwc:
+    <<: *nf
+    command: ["open5gs-run", "open5gs-sgwcd"]
+    depends_on:
+      net:
+        condition: service_healthy
+      sgwu:
+        condition: service_started
+
+  amf:
+    <<: *nf
+    command: ["open5gs-run", "open5gs-amfd"]
+
+  hss:
+    <<: *nf
+    command: ["open5gs-run", "open5gs-hssd"]
+    depends_on:
+      net:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+
+  pcrf:
+    <<: *nf
+    command: ["open5gs-run", "open5gs-pcrfd"]
+    depends_on:
+      net:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+
+  mme:
+    <<: *nf
+    command: ["open5gs-run", "open5gs-mmed"]
+    depends_on:
+      net:
+        condition: service_healthy
+      hss:
+        condition: service_started
+      sgwc:
+        condition: service_started
+
+volumes:
+  mongodb: {}
