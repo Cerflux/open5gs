@@ -16,10 +16,15 @@ Two modes, selected with --mode:
          [mme] ERROR: Cannot find Served TAI[...]
          [mme] INFO: ErrorIndication
 
-The attach sequence is:
+The attach sequence is either of these:
+
   [emm] INFO: [] Attach request
   [emm] INFO:     GUTI[...] IMSI[Unknown IMSI]
   [emm] INFO: Identity response
+  [emm] INFO:     IMSI[<IMSI>]
+
+  [mme] INFO: [<IMSI>] known UE by IMSI
+  [emm] WARNING: [<IMSI>] Attach request
   [emm] INFO:     IMSI[<IMSI>]
 
 Payloads alternate:
@@ -67,7 +72,10 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 #           GUTI[...] IMSI[Unknown IMSI]
 #           Identity response
 #           IMSI[510115592904515]          (emm-handler.c:530)
-# A WARNING line that already names the IMSI is not the initial trigger.
+# A repeat attach for a UE the MME already knows is also a trigger:
+#   [mme] INFO: [510115592904515] known UE by IMSI
+#   [emm] WARNING: [510115592904515] Attach request
+#   [emm] INFO:     IMSI[510115592904515]
 RE_ATTACH_EMPTY = re.compile(
     r"\[emm\].*?\[\s*\]\s+Attach\s+request", re.IGNORECASE
 )
@@ -116,7 +124,7 @@ RE_NAMED_ATTACH = re.compile(
 RE_GUTI_IMSI = re.compile(
     r"\[emm\].*?GUTI\[.*?\]\s+IMSI\[(\d+)\]", re.IGNORECASE
 )
-# Comes just after the retransmission marker. Not a new trigger.
+# Opens the known-UE attach sequence. The IMSI line closes it.
 RE_KNOWN_UE = re.compile(
     r"\[mme\].*?\[(\d+)\]\s+known UE by IMSI", re.IGNORECASE
 )
@@ -341,6 +349,8 @@ async def run(imsi: str, host: str, port: int, password: str | None,
     log_path = mme_log_path()
     print(f"\n[INFO] Watching IMSI : {imsi}", flush=True)
     print(f"[INFO] Mode          : {mode}", flush=True)
+    print("[INFO] Marker        : known UE by IMSI, "
+          f"[{imsi}] Attach request, IMSI[{imsi}]", flush=True)
     if mode == "trigger":
         print(f"[INFO] Trigger A     : [] Attach request then IMSI[{imsi}]",
               flush=True)
@@ -371,6 +381,9 @@ async def run(imsi: str, host: str, port: int, password: str | None,
     # Unknown UE by GUTI → [IMSI] Attach request → GUTI IMSI line.
     # step is "guti" or "attach".
     guti_seq = None
+    # known UE by IMSI → [IMSI] Attach request → IMSI[digits].
+    # step is "known" or "attach". Lines in between are ignored.
+    known_seq = None
     initial_fired = False
     # Set by "Retransmission of IMSI failed". The known UE line after
     # that marker is the same procedure and must not send.
@@ -425,6 +438,17 @@ async def run(imsi: str, host: str, port: int, password: str | None,
               f"Next switch in {interval:g}s.", flush=True)
         timer_task = asyncio.create_task(timer_loop())
 
+    async def on_attach(title: str, lines: list[str]) -> None:
+        nonlocal initial_fired
+        if mode == "timer" and not initial_fired:
+            await arm_timer(title, lines)
+            initial_fired = True
+        elif mode == "trigger":
+            await fire(title, lines)
+            initial_fired = True
+        elif initial_fired:
+            vlog("later attach, not a new trigger")
+
     try:
         while True:
             chunk = log_file.read()
@@ -445,6 +469,9 @@ async def run(imsi: str, host: str, port: int, password: str | None,
             if guti_seq and now - guti_seq["t0"] > PAIR_TIMEOUT:
                 vlog("Unknown UE by GUTI expired before Attach request")
                 guti_seq = None
+            if known_seq and now - known_seq["t0"] > PAIR_TIMEOUT:
+                vlog("known UE sequence expired before the IMSI line")
+                known_seq = None
             if pending_removed and now - pending_removed["t0"] > FOLLOW_TIMEOUT:
                 pending_removed = None
             if follow_seq and now - follow_seq["t0"] > FOLLOW_TIMEOUT:
@@ -511,6 +538,44 @@ async def run(imsi: str, host: str, port: int, password: str | None,
                             vlog(f"GUTI IMSI {m_guti_imsi.group(1)} != {imsi}")
                         continue
 
+            # Known UE already has an IMSI, so the Attach request line
+            # names it. Other lines may sit between the three markers.
+            m_known = RE_KNOWN_UE.search(line)
+            if m_known:
+                if m_known.group(1) == imsi:
+                    known_seq = {"step": "known", "t0": now, "lines": [line]}
+                    vlog(f"known UE | {line}")
+                else:
+                    vlog(f"known UE IMSI {m_known.group(1)} != {imsi}")
+                    known_seq = None
+                continue
+            if known_seq and known_seq["step"] == "known":
+                m_named = RE_NAMED_ATTACH.search(line)
+                if m_named:
+                    if m_named.group(1) == imsi:
+                        known_seq["step"] = "attach"
+                        known_seq["t0"] = now
+                        known_seq["lines"].append(line)
+                        vlog(f"known UE attach request | {line}")
+                    else:
+                        vlog(f"known UE attach IMSI {m_named.group(1)} != {imsi}")
+                        known_seq = None
+                    continue
+            if known_seq and known_seq["step"] == "attach":
+                m_known_imsi = RE_IMSI_LINE.search(line)
+                if (m_known_imsi and not RE_RETX.search(line)
+                        and not RE_GUTI_IMSI.search(line)):
+                    known_lines = known_seq["lines"] + [line]
+                    known_seq = None
+                    if m_known_imsi.group(1) == imsi:
+                        await on_attach(
+                            f"Known UE by IMSI [{imsi}]",
+                            known_lines,
+                        )
+                    else:
+                        vlog(f"known UE IMSI line {m_known_imsi.group(1)} != {imsi}")
+                    continue
+
             # Initial trigger. [] Attach request opens it. The next
             # IMSI[digits] closes it, with or without Unknown IMSI and
             # Identity response in between.
@@ -534,20 +599,11 @@ async def run(imsi: str, host: str, port: int, password: str | None,
                     attach_seq = None
 
             if revealed is not None:
-                if revealed == imsi and mode == "timer" and not initial_fired:
-                    await arm_timer(
+                if revealed == imsi:
+                    await on_attach(
                         f"Attach Request with IMSI [{imsi}]",
                         seq_lines,
                     )
-                    initial_fired = True
-                elif revealed == imsi and mode == "trigger":
-                    await fire(
-                        f"INITIAL trigger  IMSI [{imsi}]",
-                        seq_lines,
-                    )
-                    initial_fired = True
-                elif revealed == imsi and initial_fired:
-                    vlog("later [] Attach Request, not a new trigger")
                 else:
                     print(f"[SKIP]  Attach Request IMSI {revealed} "
                           f"!= watching {imsi}", flush=True)
