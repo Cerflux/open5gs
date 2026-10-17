@@ -8,6 +8,7 @@ subprojects/usrsctp
 subprojects/.wraplock
 
 webui/.next
+misc/db/python/.venv
 
 # Host copies of the runtime configs, seeded on first `docker compose up`
 docker/config/
