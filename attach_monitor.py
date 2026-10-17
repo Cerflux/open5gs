@@ -175,9 +175,18 @@ def which_config(cell: dict) -> int | None:
 
 
 def mme_log_path() -> str:
+    # Same-container Open5GS (sigsence-epc:open5gs) writes the MME log here.
+    env = os.environ.get("OPEN5GS_MME_LOG", "").strip()
+    if env:
+        return env
+    local = "/var/log/open5gs/mme.log"
+    if os.path.isfile(local):
+        return local
     pid = os.popen("docker inspect -f '{{.State.Pid}}' open5gs-mme-1").read().strip()
     if not pid or pid == "0":
-        raise RuntimeError("open5gs-mme-1 is not running")
+        raise RuntimeError(
+            "open5gs-mme-1 is not running and %s does not exist" % local
+        )
     return f"/proc/{pid}/root/var/log/open5gs/mme.log"
 
 
