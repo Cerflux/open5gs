@@ -139,7 +139,16 @@ void emm_state_security_mode(ogs_fsm_t *, mme_event_t *);
 void emm_state_initial_context_setup(ogs_fsm_t *, mme_event_t *);
 void emm_state_ue_context_will_remove(ogs_fsm_t *, mme_event_t *);
 void emm_state_exception(ogs_fsm_t *, mme_event_t *);
+static int attach_s1_release(enb_ue_t *enb, S1AP_Cause_PR group, long cause,
+        uint8_t action, ogs_time_t duration)
+{
+    f->releases++;
+    enb->ue_ctx_rel_action = action;
+    return OGS_OK;
+}
+#define s1ap_send_ue_context_release_command attach_s1_release
 #include "../../src/mme/emm-sm.c"
+#undef s1ap_send_ue_context_release_command
 
 /* Run the real EIR/ULR choice and asynchronous Delete Session Response path. */
 #define mme_send_delete_session_or_mme_ue_context_release attach_delete_or_release
@@ -444,6 +453,44 @@ static void attach_failure(abts_case *tc, void *data)
     ABTS_INT_EQUAL(tc, 37, f->ue.dl_count);
     ABTS_INT_EQUAL(tc, 0x11, f->ue.kasme[0]);
     ABTS_INT_EQUAL(tc, 0x22, f->ue.knas_int[0]);
+    fixture_final();
+}
+
+/* Fresh attach, no saved context: MAC failure leaves the S1 connection
+ * up and stays in authentication so the next Attach Request restarts it. */
+static void mac_failure_keeps_authentication(abts_case *tc, void *data)
+{
+    fixture_init(false);
+    OGS_FSM_TRAN(&f->ue.sm, emm_state_de_registered);
+    dispatch(OGS_NAS_EPS_ATTACH_REQUEST, 0, false);
+    ABTS_TRUE(tc, OGS_FSM_CHECK(&f->ue.sm, emm_state_authentication));
+    dispatch(OGS_NAS_EPS_AUTHENTICATION_FAILURE, 0, false);
+    ABTS_INT_EQUAL(tc, 0, f->rejects);
+    ABTS_INT_EQUAL(tc, 0, f->releases);
+    ABTS_INT_EQUAL(tc, S1AP_UE_CTX_REL_INVALID_ACTION,
+            f->enb.ue_ctx_rel_action);
+    ABTS_TRUE(tc, OGS_FSM_CHECK(&f->ue.sm, emm_state_authentication));
+    ABTS_INT_EQUAL(tc, 1, f->air);
+    fixture_final();
+}
+
+/* Fresh attach that never answers the challenge: T3460 must not send
+ * Authentication Reject, or the UE stops retrying. */
+static void t3460_keeps_authentication(abts_case *tc, void *data)
+{
+    mme_event_t event = {0};
+
+    fixture_init(false);
+    OGS_FSM_TRAN(&f->ue.sm, emm_state_de_registered);
+    dispatch(OGS_NAS_EPS_ATTACH_REQUEST, 0, false);
+    ABTS_TRUE(tc, OGS_FSM_CHECK(&f->ue.sm, emm_state_authentication));
+    event.id = MME_EVENT_EMM_TIMER;
+    event.mme_ue_id = f->ue.id;
+    event.timer_id = MME_TIMER_T3460;
+    f->ue.t3460.retry_count = mme_timer_cfg(MME_TIMER_T3460)->max_count;
+    ogs_fsm_dispatch(&f->ue.sm, &event);
+    ABTS_INT_EQUAL(tc, 0, f->rejects);
+    ABTS_TRUE(tc, OGS_FSM_CHECK(&f->ue.sm, emm_state_authentication));
     fixture_final();
 }
 
@@ -786,6 +833,8 @@ abts_suite *test_mme_attach(abts_suite *suite)
     abts_run_test(suite, repeated_attach, NULL);
     for (i = 0; i < 7; i++)
         abts_run_test(suite, attach_failure, OGS_UINT_TO_POINTER(i));
+    abts_run_test(suite, mac_failure_keeps_authentication, NULL);
+    abts_run_test(suite, t3460_keeps_authentication, NULL);
     abts_run_test(suite, invalid_security_complete, NULL);
     abts_run_test(suite, authenticated_session_delete, NULL);
     abts_run_test(suite, verified_attach, NULL);
