@@ -629,6 +629,11 @@ struct mme_ue_s {
     /* flag: 1 = allow restoration of context, 0 = disallow */
     bool            can_restore_context;
 
+    /* Registered attach: HSS knows the IMSI, but no Authentication
+     * Request is sent. The S1 connection stays up so a TAC/CI change
+     * makes the UE attach again. */
+    bool            auth_ignored;
+
     /* Authenticated Attach waiting for the old PDN sessions to be deleted. */
     bool            attach_session_delete_pending;
 

@@ -1224,6 +1224,10 @@ void emm_state_authentication(ogs_fsm_t *s, mme_event_t *e)
     case MME_EVENT_EMM_TIMER:
         switch (e->timer_id) {
         case MME_TIMER_T3460:
+            if (mme_ue->auth_ignored) {
+                CLEAR_MME_UE_TIMER(mme_ue->t3460);
+                break;
+            }
             if (mme_ue->t3460.retry_count >=
                     mme_timer_cfg(MME_TIMER_T3460)->max_count) {
                 ogs_warn("Retransmission of IMSI[%s] failed. "

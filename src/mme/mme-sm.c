@@ -743,6 +743,24 @@ void mme_state_operational(ogs_fsm_t *s, mme_event_t *e)
                 mme_ue->gn.gtp_xact_id = e->gtp_xact_id;
             }
 
+            /*
+             * The HSS has this IMSI, so the attach is not rejected.
+             * Do not send Authentication Request and do not release S1.
+             * The UE stays halted on this connection and sends a new
+             * Attach Request when TAC or cell identity changes. The next
+             * attach asks the HSS again, so an IMSI removed from the
+             * database still receives Attach Reject above.
+             * TAU is unchanged and still gets Authentication Request.
+             */
+            if (mme_ue->nas_eps.type == MME_EPS_TYPE_ATTACH_REQUEST) {
+                mme_ue->auth_ignored = true;
+                CLEAR_MME_UE_TIMER(mme_ue->t3460);
+                ogs_warn("[%s] Authentication ignored; connection held, "
+                        "waiting for the next Attach request",
+                        mme_ue->imsi_bcd);
+                break;
+            }
+
             /* Auth-Info accepted from HSS, now authenticate the UE: */
             r = nas_eps_send_authentication_request(mme_ue);
             ogs_expect(r == OGS_OK);
