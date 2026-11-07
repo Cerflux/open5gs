@@ -27,7 +27,9 @@ import hmac
 import json
 import os
 import re
+import socket
 import sys
+import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta
@@ -39,7 +41,8 @@ except ImportError:
     print("          pip install websockets")
     sys.exit(1)
 
-STATS_FIELDS = ("epre", "ul_phr", "ul_path_loss", "p_ue")
+STATS_FIELDS = ("epre", "snr", "pucch1_snr", "pusch_snr", "ul_phr", "ul_path_loss", "p_ue")
+PUBLISH_FIELDS = ("epre", "snr", "p_ue", "path_loss", "rx_level")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 RE_LOG_TS = re.compile(
     r"^(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2})\.(\d{3})"
@@ -110,12 +113,12 @@ def ue_records(msg: dict) -> list:
                 if not isinstance(cell, dict):
                     continue
                 blob = cell.get("stats") if isinstance(cell.get("stats"), dict) else cell
-                rows.append({
+                rows.append(normalize_row({
                     "cell_id": cell.get("cell_id", cell.get("cell")),
                     **dig_stats(blob),
-                })
+                }))
         if not rows:
-            rows.append({"cell_id": None, **dig_stats(ue)})
+            rows.append(normalize_row({"cell_id": None, **dig_stats(ue)}))
         records.append({
             "enb_ue_id": enb_ue_id,
             "rnti": rnti,
@@ -133,9 +136,22 @@ def fmt_rnti(rnti) -> str:
 def rx_level(row: dict):
     """Received level in dB: UE transmit power minus uplink path loss."""
     try:
-        return float(row["p_ue"]) - float(row["ul_path_loss"])
+        return float(row["p_ue"]) - float(row["path_loss"])
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def normalize_row(row: dict) -> dict:
+    """Expose snr, path_loss, and rx_level next to the raw ue_get fields."""
+    if row.get("snr") is None:
+        for key in ("pucch1_snr", "pusch_snr"):
+            if row.get(key) is not None:
+                row["snr"] = row[key]
+                break
+    if row.get("path_loss") is None and row.get("ul_path_loss") is not None:
+        row["path_loss"] = row["ul_path_loss"]
+    row["rx_level"] = rx_level(row)
+    return row
 
 
 def fmt_number(value) -> str:
@@ -153,11 +169,11 @@ def fmt_stats(rows: list) -> str:
         cell = row.get("cell_id")
         if cell is not None:
             bits.append(f"cell={cell}")
-        for key in STATS_FIELDS:
+        for key in PUBLISH_FIELDS:
             value = row.get(key, "-")
+            if value is None:
+                value = "-"
             bits.append(f"{key}={fmt_number(value) if isinstance(value, float) else value}")
-        level = rx_level(row)
-        bits.append(f"rx_level={fmt_number(level) if level is not None else '-'}")
         parts.append(" ".join(bits))
     return " | ".join(parts) if parts else " ".join(f"{k}=-" for k in STATS_FIELDS)
 
@@ -276,6 +292,103 @@ def closest_sample(samples, when: float, window: float):
     return best
 
 
+class _IPCPublisher:
+    """Send ue_stats to imsi-farming, which rebroadcasts them to the middleware.
+
+    imsi-farming also pushes every farming event back on this socket, so a
+    reader thread drains it. A full receive buffer would block the next send.
+    """
+
+    def __init__(self):
+        self.path = os.environ.get("IPC_SOCKET_PATH", "/ipc/socket")
+        self.sock = None
+        self._id = 0
+        self._reader = False
+
+    def _connect(self) -> bool:
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(1.0)
+            sock.connect(self.path)
+            self.sock = sock
+            if not self._reader:
+                self._reader = True
+                threading.Thread(target=self._drain, daemon=True).start()
+            return True
+        except OSError:
+            self.sock = None
+            return False
+
+    def _drain(self) -> None:
+        while True:
+            sock = self.sock
+            if sock is None:
+                time.sleep(0.2)
+                continue
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                continue
+            except OSError:
+                time.sleep(0.2)
+                continue
+            if not chunk:
+                time.sleep(0.2)
+
+    def send(self, params: dict) -> None:
+        if not self.path:
+            return
+        self._id += 1
+        msg = {
+            "jsonrpc": "2.0",
+            "method": "ue_stats",
+            "id": self._id,
+            "params": params,
+        }
+        data = (json.dumps(msg) + "\n").encode("utf-8")
+        for _ in range(2):
+            if self.sock is None and not self._connect():
+                return
+            try:
+                self.sock.sendall(data)
+                return
+            except OSError:
+                try:
+                    self.sock.close()
+                except OSError:
+                    pass
+                self.sock = None
+
+
+_ipc = _IPCPublisher()
+
+
+def _best_row(rows: list) -> dict | None:
+    best = None
+    best_score = -1
+    for row in rows:
+        score = sum(1 for key in PUBLISH_FIELDS if row.get(key) is not None)
+        if score > best_score:
+            best = row
+            best_score = score
+    return best if best_score > 0 else None
+
+
+def publish_ue_stats(imsi, ue: dict | None) -> None:
+    if not imsi or not ue:
+        return
+    row = _best_row(ue.get("rows") or [])
+    if row is None:
+        return
+    params = {"imsi": str(imsi), "enb_ue_id": ue.get("enb_ue_id")}
+    for key in PUBLISH_FIELDS:
+        value = row.get(key)
+        if isinstance(value, float):
+            value = round(value, 3)
+        params[key] = value
+    _ipc.send(params)
+
+
 def print_event(event: dict, ue: dict | None, sample_time: float | None):
     title = "ATTACH-REQUEST" if event["kind"] == "request" else "ATTACH-REJECT"
     cause = f" cause={event['cause']}" if event["cause"] else ""
@@ -293,6 +406,7 @@ def print_event(event: dict, ue: dict | None, sample_time: float | None):
           f"enb_ue_id={ue['enb_ue_id']} rnti={fmt_rnti(ue['rnti'])}",
           flush=True)
     print(f"          {fmt_stats(ue['rows'])}", flush=True)
+    publish_ue_stats(event["imsi"], ue)
 
 
 async def send_and_recv(ws, payload: dict, counter: list,
@@ -431,8 +545,8 @@ async def run(host: str, port: int, password: str | None,
     pace = f"{interval * 1000:g}ms" if interval < 1 else f"{interval:g}s"
     print(f"[INFO] ue_get interval : {pace}   join window {window:g}s",
           flush=True)
-    print("[INFO] Fields          : epre ul_phr ul_path_loss p_ue "
-          "rx_level(p_ue - ul_path_loss)\n", flush=True)
+    print("[INFO] Fields          : epre snr p_ue path_loss "
+          "rx_level(p_ue - path_loss)\n", flush=True)
 
     samples = deque(maxlen=max(32, int(120 / max(interval, 0.05))))
     pending = []
@@ -502,12 +616,17 @@ async def run(host: str, port: int, password: str | None,
                         del bound[enb_id]
                         continue
                     rendered = fmt_stats(ue["rows"])
-                    if rendered != info["last"]:
+                    changed = rendered != info["last"]
+                    due = now - info.get("published", 0) >= 2.0
+                    if changed or due:
                         info["last"] = rendered
-                        print(f"[STATS] {fmt_wall(now)} IMSI={info['imsi']} "
-                              f"enb_ue_id={ue['enb_ue_id']} "
-                              f"rnti={fmt_rnti(ue['rnti'])} {rendered}",
-                              flush=True)
+                        info["published"] = now
+                        if changed:
+                            print(f"[STATS] {fmt_wall(now)} IMSI={info['imsi']} "
+                                  f"enb_ue_id={ue['enb_ue_id']} "
+                                  f"rnti={fmt_rnti(ue['rnti'])} {rendered}",
+                                  flush=True)
+                        publish_ue_stats(info["imsi"], ue)
             elif msg and msg.get("error"):
                 print(f"[ERROR] ue_get: {msg.get('error')}", flush=True)
             remain = interval - (time.monotonic() - started)
@@ -534,11 +653,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Join Amarisoft ue_get stats to every attaching IMSI."
     )
-    parser.add_argument("--host", default="127.0.0.1",
-                        help="eNB WebSocket host (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=9001,
-                        help="eNB WebSocket port (default: 9001)")
-    parser.add_argument("-p", "--password", default=None,
+    parser.add_argument("--host", default=os.environ.get("ENB_WS_HOST", "127.0.0.1"),
+                        help="eNB WebSocket host (default: 127.0.0.1 or ENB_WS_HOST)")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("ENB_WS_PORT", "9001")),
+                        help="eNB WebSocket port (default: 9001 or ENB_WS_PORT)")
+    parser.add_argument("-p", "--password", default=os.environ.get("ENB_WS_PASSWORD") or None,
                         help="Password for the eNB WebSocket")
     parser.add_argument("--interval", type=float, default=0.01,
                         help="Seconds between ue_get polls (default: 0.01, 10 ms)")
