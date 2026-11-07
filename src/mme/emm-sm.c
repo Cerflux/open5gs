@@ -1115,22 +1115,6 @@ void emm_state_authentication(ogs_fsm_t *s, mme_event_t *e)
             switch (authentication_failure->emm_cause) {
             case OGS_NAS_EMM_CAUSE_MAC_FAILURE:
                 ogs_warn("Authentication failure(MAC failure)");
-                /*
-                 * A fresh attach has nothing to restore. Authentication
-                 * Reject makes the UE stop until power cycle, and releasing
-                 * S1 drops the connection the next Attach Request needs.
-                 * Leave the S1 connection up and stay in this state.
-                 * T3460 is already stopped above. The next Attach Request
-                 * is handled below and authentication starts again.
-                 *
-                 * A UE that was already registered still falls through
-                 * so its previous context is restored.
-                 */
-                if (!mme_ue->can_restore_context) {
-                    ogs_warn("[%s] MAC failure: stay in authentication, "
-                            "wait for Attach request", mme_ue->imsi_bcd);
-                    return;
-                }
                 break;
             case OGS_NAS_EMM_CAUSE_NON_EPS_AUTHENTICATION_UNACCEPTABLE:
                 ogs_error("Authentication failure"
@@ -1244,18 +1228,6 @@ void emm_state_authentication(ogs_fsm_t *s, mme_event_t *e)
                     mme_timer_cfg(MME_TIMER_T3460)->max_count) {
                 ogs_warn("Retransmission of IMSI[%s] failed. "
                         "Stop retransmission", mme_ue->imsi_bcd);
-                /*
-                 * Authentication Reject is what stops the UE. A fresh
-                 * attach has no context to restore, so keep waiting for
-                 * the next Attach Request instead of rejecting it.
-                 * A UE that was already registered still takes the
-                 * reject path so its previous context is restored.
-                 */
-                if (!mme_ue->can_restore_context) {
-                    ogs_warn("[%s] T3460 expired: stay in authentication, "
-                            "wait for Attach request", mme_ue->imsi_bcd);
-                    break;
-                }
                 r = nas_eps_send_authentication_reject(mme_ue);
                 ogs_expect(r == OGS_OK);
                 ogs_assert(r != OGS_ERROR);
