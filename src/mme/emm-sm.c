@@ -1167,6 +1167,11 @@ void emm_state_authentication(ogs_fsm_t *s, mme_event_t *e)
                     mme_ue->imsi_bcd, message->emm.emm_status.emm_cause);
             break;
         case OGS_NAS_EPS_DETACH_REQUEST:
+            if (mme_ue->auth_ignored) {
+                ogs_warn("[%s] Discard Detach while authentication is ignored",
+                        mme_ue->imsi_bcd);
+                break;
+            }
             h.type = e->nas_type;
             if (mme_ue->can_restore_context &&
                 (!h.integrity_protected || !SECURITY_CONTEXT_IS_VALID(mme_ue))) {

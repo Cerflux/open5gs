@@ -1269,6 +1269,83 @@ ogs_pkbuf_t *s1ap_build_ue_context_release_command(
     return ogs_s1ap_encode(&pdu);
 }
 
+ogs_pkbuf_t *s1ap_build_connection_establishment_indication(enb_ue_t *enb_ue)
+{
+    S1AP_S1AP_PDU_t pdu;
+    S1AP_InitiatingMessage_t *initiatingMessage = NULL;
+    S1AP_ConnectionEstablishmentIndication_t *ConnectionEstablishmentIndication = NULL;
+
+    S1AP_ConnectionEstablishmentIndicationIEs_t *ie = NULL;
+    S1AP_MME_UE_S1AP_ID_t *MME_UE_S1AP_ID = NULL;
+    S1AP_ENB_UE_S1AP_ID_t *ENB_UE_S1AP_ID = NULL;
+
+    ogs_assert(enb_ue);
+
+    if (enb_ue->mme_ue_s1ap_id == 0 ||
+        enb_ue->enb_ue_s1ap_id == INVALID_UE_S1AP_ID) {
+        ogs_error("invalid S1AP UE id");
+        return NULL;
+    }
+
+    ogs_debug("ConnectionEstablishmentIndication");
+
+    memset(&pdu, 0, sizeof(S1AP_S1AP_PDU_t));
+    pdu.present = S1AP_S1AP_PDU_PR_initiatingMessage;
+    pdu.choice.initiatingMessage = CALLOC(1, sizeof(*initiatingMessage));
+
+    initiatingMessage = pdu.choice.initiatingMessage;
+    ogs_assert(initiatingMessage);
+    initiatingMessage->procedureCode =
+        S1AP_ProcedureCode_id_ConnectionEstablishmentIndication;
+    initiatingMessage->criticality = S1AP_Criticality_reject;
+    initiatingMessage->value.present =
+        S1AP_InitiatingMessage__value_PR_ConnectionEstablishmentIndication;
+
+    initiatingMessage->value.choice.ConnectionEstablishmentIndication =
+        CALLOC(1, sizeof(*ConnectionEstablishmentIndication));
+    ConnectionEstablishmentIndication =
+        initiatingMessage->value.choice.ConnectionEstablishmentIndication;
+    ogs_assert(ConnectionEstablishmentIndication);
+
+    ConnectionEstablishmentIndication->protocolIEs =
+        ogs_asn_calloc_protocol_ies(
+            &asn_DEF_S1AP_ConnectionEstablishmentIndication);
+    ogs_assert(ConnectionEstablishmentIndication->protocolIEs);
+
+    ie = CALLOC(1, sizeof(*ie));
+    ogs_assert(ie);
+    ASN_SEQUENCE_ADD(ConnectionEstablishmentIndication->protocolIEs, ie);
+
+    ie->id = S1AP_ProtocolIE_ID_id_MME_UE_S1AP_ID;
+    ie->criticality = S1AP_Criticality_ignore;
+    ie->value.present =
+        S1AP_ConnectionEstablishmentIndicationIEs__value_PR_MME_UE_S1AP_ID;
+
+    ie->value.choice.MME_UE_S1AP_ID = CALLOC(1, sizeof(*MME_UE_S1AP_ID));
+    MME_UE_S1AP_ID = ie->value.choice.MME_UE_S1AP_ID;
+    ogs_assert(MME_UE_S1AP_ID);
+
+    ie = CALLOC(1, sizeof(*ie));
+    ogs_assert(ie);
+    ASN_SEQUENCE_ADD(ConnectionEstablishmentIndication->protocolIEs, ie);
+
+    ie->id = S1AP_ProtocolIE_ID_id_eNB_UE_S1AP_ID;
+    ie->criticality = S1AP_Criticality_ignore;
+    ie->value.present =
+        S1AP_ConnectionEstablishmentIndicationIEs__value_PR_ENB_UE_S1AP_ID;
+
+    ie->value.choice.ENB_UE_S1AP_ID = CALLOC(1, sizeof(*ENB_UE_S1AP_ID));
+    ENB_UE_S1AP_ID = ie->value.choice.ENB_UE_S1AP_ID;
+    ogs_assert(ENB_UE_S1AP_ID);
+
+    ogs_debug("    ENB_UE_S1AP_ID[%d] MME_UE_S1AP_ID[%d]",
+            enb_ue->enb_ue_s1ap_id, enb_ue->mme_ue_s1ap_id);
+
+    *MME_UE_S1AP_ID = enb_ue->mme_ue_s1ap_id;
+    *ENB_UE_S1AP_ID = enb_ue->enb_ue_s1ap_id;
+
+    return ogs_s1ap_encode(&pdu);
+}
 
 ogs_pkbuf_t *s1ap_build_e_rab_setup_request(
             mme_bearer_t *bearer, ogs_pkbuf_t *esmbuf)

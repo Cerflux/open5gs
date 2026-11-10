@@ -520,6 +520,30 @@ int s1ap_send_ue_context_release_command(
     return rv;
 }
 
+int s1ap_send_connection_establishment_indication(enb_ue_t *enb_ue)
+{
+    int rv;
+    ogs_pkbuf_t *s1apbuf = NULL;
+
+    ogs_debug("ConnectionEstablishmentIndication");
+
+    if (!enb_ue) {
+        ogs_error("S1 context has already been removed");
+        return OGS_NOTFOUND;
+    }
+
+    s1apbuf = s1ap_build_connection_establishment_indication(enb_ue);
+    if (!s1apbuf) {
+        ogs_error("s1ap_build_connection_establishment_indication() failed");
+        return OGS_ERROR;
+    }
+
+    rv = s1ap_send_to_enb_ue(enb_ue, s1apbuf);
+    ogs_expect(rv == OGS_OK);
+
+    return rv;
+}
+
 int s1ap_send_paging(mme_ue_t *mme_ue, S1AP_CNDomain_t cn_domain)
 {
     ogs_pkbuf_t *s1apbuf = NULL;

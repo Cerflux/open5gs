@@ -44,6 +44,7 @@ ogs_pkbuf_t *s1ap_build_initial_context_setup_request(
 ogs_pkbuf_t *s1ap_build_ue_context_modification_request(mme_ue_t *mme_ue);
 ogs_pkbuf_t *s1ap_build_ue_context_release_command(
     enb_ue_t *enb_ue, S1AP_Cause_PR group, long cause);
+ogs_pkbuf_t *s1ap_build_connection_establishment_indication(enb_ue_t *enb_ue);
 
 ogs_pkbuf_t *s1ap_build_e_rab_setup_request(
     mme_bearer_t *bearer, ogs_pkbuf_t *esmbuf);

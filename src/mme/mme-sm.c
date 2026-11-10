@@ -751,10 +751,20 @@ void mme_state_operational(ogs_fsm_t *s, mme_event_t *e)
              * attach asks the HSS again, so an IMSI removed from the
              * database still receives Attach Reject above.
              * TAU is unchanged and still gets Authentication Request.
+             *
+             * InitialUEMessage carries only the eNB UE S1AP ID. Until the
+             * MME sends a downlink S1AP message, the eNB has no MME UE
+             * S1AP ID and drops later uplink NAS ("No S1AP connection").
+             * Connection Establishment Indication gives the eNB that ID
+             * without a NAS PDU, so the UE's next Attach request on this
+             * RRC connection is forwarded.
              */
             if (mme_ue->nas_eps.type == MME_EPS_TYPE_ATTACH_REQUEST) {
                 mme_ue->auth_ignored = true;
                 CLEAR_MME_UE_TIMER(mme_ue->t3460);
+                r = s1ap_send_connection_establishment_indication(enb_ue);
+                ogs_expect(r == OGS_OK);
+                ogs_assert(r != OGS_ERROR);
                 ogs_warn("[%s] Authentication ignored; connection held, "
                         "waiting for the next Attach request",
                         mme_ue->imsi_bcd);
