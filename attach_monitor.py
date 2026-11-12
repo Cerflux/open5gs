@@ -34,6 +34,18 @@ Payloads alternate:
 
 config_get runs once at startup to see which of those is live.
 
+The same process keeps a UE map for the watched IMSI. It tails the
+Amarisoft eNB log and the Open5GS MME log and joins them on the
+eNB UE S1AP ID (Amarisoft prints it in hex, the MME in decimal).
+Each RRC, S1, and NAS change prints the current lifecycle.
+
+RX level comes from the eNB PHY log over the same websocket:
+  {"message":"log_get","log_options":"phy.level=debug"}
+Only UL PUSCH lines are used. EPRE is the power of one resource element,
+and each PRB has 12 subcarriers, so
+  rx_level = epre + 10*log10(n_prb * 12)
+The line also shows PRB, TA, SNR, and HARQ.
+
 Usage:
   python3 attach_monitor.py <IMSI>
   python3 attach_monitor.py <IMSI> --mode timer --interval 10
@@ -45,10 +57,12 @@ import asyncio
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import sys
 import time
+from datetime import datetime
 
 try:
     import websockets
@@ -129,6 +143,538 @@ RE_KNOWN_UE = re.compile(
     r"\[mme\].*?\[(\d+)\]\s+known UE by IMSI", re.IGNORECASE
 )
 
+RE_CLOCK = re.compile(r"(\d{2}:\d{2}:\d{2}\.\d+)")
+# prb and symb are start:count. EPRE is dBm per resource element.
+RE_PUSCH = re.compile(
+    r"harq=(?P<harq>\d+)\s+"
+    r"prb=(?P<prb_start>\d+):(?P<n_prb>\d+)\s+"
+    r"symb=(?P<symb_start>\d+):(?P<n_symb>\d+).*?"
+    r"snr=(?P<snr>-?\d+(?:\.\d+)?)\s+"
+    r"epre=(?P<epre>-?\d+(?:\.\d+)?)\s+"
+    r"ta=(?P<ta>-?\d+(?:\.\d+)?)"
+)
+RE_PUSCH_CRC = re.compile(r"\bcrc=(\w+)")
+# One summary a second. log_get itself is polled faster so the PHY buffer drains.
+RX_PRINT_EVERY = 1.0
+PHY_POLL_EVERY = 0.2
+RE_ENB_RRC_NOTE = re.compile(
+    r"\[RRC\]\s+-\s+(\d{4})\s+\d+\s+(No S1AP connection.*)$"
+)
+RE_ENB_RRC = re.compile(
+    r"\[RRC\]\s+(?:UL|DL|-)\s+(\d{4})\s+\d+\s+\S+:\s+(.*)$"
+)
+RE_ENB_NAS = re.compile(
+    r"\[NAS\]\s+(?:UL|DL)\s+(\d{4})\s+\S+:\s+(.*)$"
+)
+RE_ENB_S1 = re.compile(
+    r"\[S1AP\]\s+(TO|FROM)\s+(\S+)\s+(\S+)\s+\S+\s+(.*)$"
+)
+RE_ENB_S1_LINK = re.compile(
+    r"\[S1AP\]\s+-\s+(Closing connection|Connected|Connecting)\b"
+)
+RE_MME_IDS = re.compile(
+    r"ENB_UE_S1AP_ID\[(\d+)\]\s+MME_UE_S1AP_ID\[(\d+)\]"
+    r"(?:\s+TAC\[(\d+)\]\s+CellID\[(0x[0-9a-fA-F]+)\])?"
+)
+RE_MME_UE_EVENT = re.compile(
+    r"\[(\d+)\]\s+(known UE by IMSI|Unknown UE by IMSI|"
+    r"Holding S1 Context|Holding S1 context has already been removed|"
+    r"Authentication ignored|Discard Detach|Attach reject)"
+)
+RE_MME_RELEASE = re.compile(r"UE Context Release \[Action:(\d+)\]")
+RE_MME_IMPLICIT = re.compile(r"Implicit S1 release")
+RE_MME_INITIAL = re.compile(r"InitialUEMessage")
+RE_MME_LINK_DOWN = re.compile(r"eNB-S1\[.*?\] connection refused")
+
+# UE Context Release action, from s1ap-handler.c.
+S1_ACTION = {
+    "1": ("s1-removed", "S1 context removed"),
+    "2": ("left-enb", "UE left this eNB"),
+    "3": ("ue-removed", "MME UE context removed"),
+}
+
+
+def clock_of(line: str) -> str:
+    match = RE_CLOCK.search(line)
+    return match.group(1) if match else "--:--:--.---"
+
+
+def parse_pusch(text: str) -> dict | None:
+    """RX level (dBm) from a PUSCH HARQ line.
+
+    EPRE is the measured power of one resource element. The allocation
+    covers n_prb resource blocks and each resource block has 12 subcarriers,
+    so the received power of that PUSCH is
+
+        rx_level = epre + 10*log10(n_prb * 12)
+    """
+    match = RE_PUSCH.search(text)
+    if not match:
+        return None
+    n_prb = int(match.group("n_prb"))
+    if n_prb <= 0:
+        return None
+    epre = float(match.group("epre"))
+    crc = RE_PUSCH_CRC.search(text)
+    return {
+        "harq": int(match.group("harq")),
+        "prb_start": int(match.group("prb_start")),
+        "n_prb": n_prb,
+        "symb_start": int(match.group("symb_start")),
+        "n_symb": int(match.group("n_symb")),
+        "snr": float(match.group("snr")),
+        "epre": epre,
+        "ta": float(match.group("ta")),
+        "crc": crc.group(1) if crc else "-",
+        "rx": epre + 10.0 * math.log10(n_prb * 12),
+    }
+
+
+def phy_clock(timestamp) -> str:
+    if isinstance(timestamp, (int, float)) and timestamp > 1_000_000_000_000:
+        return datetime.fromtimestamp(timestamp / 1000.0).strftime("%H:%M:%S.%f")[:-3]
+    return "--:--:--.---"
+
+
+def hex_id(token: str) -> int | None:
+    if token == "-":
+        return None
+    try:
+        return int(token, 16)
+    except ValueError:
+        return None
+
+
+class UeRec:
+    def __init__(self):
+        self.imsi = None
+        self.enb_id = None
+        self.mme_id = None
+        self.tac = None
+        self.cell = None
+        self.rrc = "-"
+        self.s1 = "-"
+        self.nas = "-"
+        self.enb_ts = "-"
+        self.enb_event = "-"
+        self.mme_ts = "-"
+        self.mme_event = "-"
+        self.rx_level = None
+        self.rx_epre = None
+        self.rx_prb = None
+        self.rx_ta = None
+        self.rx_snr = None
+        self.rx_harq = None
+
+    def phase(self) -> str:
+        if self.s1 == "link-down":
+            return "eNB S1 link down"
+        if self.s1 == "missing":
+            return "eNB has no S1 association"
+        if self.s1 == "held":
+            return "previous S1 held on MME"
+        if self.s1 == "expired":
+            return "held S1 released on MME"
+        if self.s1 == "left-enb":
+            return "UE left this eNB"
+        if self.s1 == "ue-removed":
+            return "MME UE context removed"
+        if self.s1 == "s1-removed":
+            return "S1 context removed"
+        if self.nas == "detach-discarded":
+            return "detach discarded, still on this eNB"
+        if self.nas == "detach-request" and self.s1 == "associated":
+            return "UE sent detach, S1 still up"
+        if self.nas == "auth-ignored" and self.s1 == "associated":
+            return "auth-ignored, connected to this eNB"
+        if self.nas == "auth-ignored":
+            return "auth-ignored"
+        if self.nas == "attach-reject":
+            return "attach rejected"
+        if self.nas == "attach" and self.s1 == "associated":
+            return "attach sent, S1 associated"
+        if self.rrc == "released":
+            return "RRC released"
+        if self.s1 == "associated":
+            return "S1 associated"
+        if self.s1 == "initial":
+            return "S1 initial UE"
+        if self.rrc == "connected":
+            return "RRC connected"
+        if self.rrc == "connecting":
+            return "RRC connecting"
+        return "seen"
+
+
+class UeMap:
+    """Join one IMSI across the Amarisoft eNB log and the Open5GS MME log."""
+
+    def __init__(self, imsi: str):
+        self.imsi = imsi
+        self.by_enb: dict[int, UeRec] = {}
+        self.by_imsi: dict[str, UeRec] = {}
+        # ("hold", imsi) | ("release", action) | ("implicit", None)
+        self.pending = None
+        self.active: UeRec | None = None
+        self._rx_bucket: list[dict] = []
+        self._rx_enb = None
+        self._rx_print_at = 0.0
+
+    def on_enb(self, line: str) -> None:
+        ts = clock_of(line)
+        link = RE_ENB_S1_LINK.search(line)
+        if link:
+            kind = link.group(1)
+            if kind == "Closing connection":
+                for rec in self._watched():
+                    rec.s1 = "link-down"
+                    self._show(rec, "enb", ts, "S1 link closed")
+            elif kind == "Connected":
+                for rec in self._watched():
+                    if rec.s1 == "link-down":
+                        rec.s1 = "-"
+                        self._show(rec, "enb", ts, "S1 link connected")
+            return
+
+        note = RE_ENB_RRC_NOTE.search(line)
+        if note:
+            rec = self._enb(int(note.group(1), 16))
+            rec.s1 = "missing"
+            self._show(rec, "enb", ts, note.group(2))
+            return
+
+        rrc = RE_ENB_RRC.search(line)
+        if rrc:
+            enb_id = int(rrc.group(1), 16)
+            text = rrc.group(2).strip()
+            if text.startswith("RRC connection request"):
+                rec = self._fresh_enb(enb_id)
+                rec.rrc = "connecting"
+                self._show(rec, "enb", ts, "RRC connection request")
+            elif text.startswith("RRC connection setup complete"):
+                rec = self._enb(enb_id)
+                rec.rrc = "connected"
+                self._show(rec, "enb", ts, "RRC connection setup complete")
+            elif text.startswith("RRC connection release"):
+                rec = self._enb(enb_id)
+                rec.rrc = "released"
+                self._show(rec, "enb", ts, "RRC connection release")
+            return
+
+        nas = RE_ENB_NAS.search(line)
+        if nas:
+            rec = self._enb(int(nas.group(1), 16))
+            text = nas.group(2).strip()
+            if text.startswith("Attach request"):
+                if rec.nas != "auth-ignored":
+                    rec.nas = "attach"
+                if rec.rrc == "-":
+                    rec.rrc = "connected"
+                self._show(rec, "enb", ts, "Attach request")
+            elif text.startswith("Detach request"):
+                rec.nas = "detach-request"
+                self._show(rec, "enb", ts, "Detach request")
+            elif text.startswith("Authentication"):
+                self._show(rec, "enb", ts, text)
+            return
+
+        s1 = RE_ENB_S1.search(line)
+        if not s1:
+            return
+        direction, mme_tok, enb_tok, text = s1.groups()
+        enb_id = hex_id(enb_tok)
+        mme_id = hex_id(mme_tok)
+        text = text.strip()
+        if enb_id is None:
+            return
+        if text.startswith("Initial UE message"):
+            rec = self._fresh_enb(enb_id)
+            rec.s1 = "initial"
+            if mme_id is not None:
+                rec.mme_id = mme_id
+            if rec.rrc == "-":
+                rec.rrc = "connected"
+            self.active = rec
+            self._show(rec, "enb", ts, "Initial UE message")
+            return
+        rec = self._enb(enb_id)
+        if mme_id is not None:
+            rec.mme_id = mme_id
+        if text.startswith("Connection establishment indication"):
+            rec.s1 = "associated"
+            self._show(rec, "enb", ts, "Connection establishment indication")
+        elif text.startswith("Uplink NAS transport"):
+            if rec.s1 in ("-", "initial", "missing"):
+                rec.s1 = "associated"
+            self._show(rec, "enb", ts, "Uplink NAS transport")
+        elif text.lower().startswith("ue context release command"):
+            self._show(rec, "enb", ts, "UE context release command")
+        elif text.lower().startswith("ue context release complete"):
+            if rec.s1 not in ("left-enb", "ue-removed", "s1-removed", "expired"):
+                rec.s1 = "s1-removed"
+            rec.rrc = "released"
+            self._show(rec, "enb", ts, "UE context release complete")
+        elif direction == "FROM" and "Error indication" in text:
+            self._show(rec, "enb", ts, "Error indication")
+
+    def on_mme(self, line: str) -> None:
+        ts = clock_of(line)
+        if RE_MME_LINK_DOWN.search(line):
+            for rec in self._watched():
+                rec.s1 = "link-down"
+                self._show(rec, "mme", ts, "eNB S1 connection refused")
+            return
+        if RE_MME_INITIAL.search(line):
+            return
+
+        ids = RE_MME_IDS.search(line)
+        if ids and ids.group(3):
+            enb_id = int(ids.group(1))
+            mme_id = int(ids.group(2))
+            rec = self.by_enb.get(enb_id)
+            if (rec is None or rec.mme_id not in (None, mme_id)
+                    or rec.s1 in ("released", "left-enb", "ue-removed",
+                                  "expired", "held", "link-down", "s1-removed")):
+                rec = UeRec()
+                rec.enb_id = enb_id
+                self.by_enb[enb_id] = rec
+            rec.mme_id = mme_id
+            rec.tac = int(ids.group(3))
+            rec.cell = ids.group(4)
+            if rec.s1 in ("-", "missing"):
+                rec.s1 = "initial"
+            self.pending = None
+            self.active = rec
+            self._show(rec, "mme", ts,
+                       f"Initial UE  TAC {rec.tac}  CI {rec.cell}")
+            return
+
+        if ids and self.pending:
+            kind, extra = self.pending
+            self.pending = None
+            enb_id = int(ids.group(1))
+            mme_id = int(ids.group(2))
+            rec = self.by_enb.get(enb_id)
+            if rec is None:
+                rec = UeRec()
+                rec.enb_id = enb_id
+                self.by_enb[enb_id] = rec
+            rec.mme_id = mme_id
+            if kind == "hold":
+                rec.imsi = rec.imsi or extra
+                rec.s1 = "held"
+                self._show(rec, "mme", ts, "Holding previous S1")
+            elif kind == "implicit":
+                rec.s1 = "expired"
+                self._show(rec, "mme", ts, "Implicit S1 release")
+            elif kind == "release":
+                state, label = S1_ACTION.get(extra, ("s1-removed", "S1 released"))
+                rec.s1 = state
+                if state in ("left-enb", "ue-removed", "s1-removed"):
+                    rec.rrc = "released"
+                self._show(rec, "mme", ts, f"{label}  action {extra}")
+            return
+
+        event = RE_MME_UE_EVENT.search(line)
+        if event:
+            imsi, name = event.group(1), event.group(2)
+            if name in ("known UE by IMSI", "Unknown UE by IMSI"):
+                rec = self._current_unbound() or self.by_imsi.get(imsi)
+                if rec is None:
+                    rec = UeRec()
+                self.active = rec
+                rec.imsi = imsi
+                if rec.enb_id is not None:
+                    self.by_enb[rec.enb_id] = rec
+                self.by_imsi[imsi] = rec
+                label = "known UE" if name.startswith("known") else "unknown UE"
+                self._show(rec, "mme", ts, label)
+                return
+            if name == "Holding S1 Context":
+                self.pending = ("hold", imsi)
+                return
+            if name == "Holding S1 context has already been removed":
+                rec = self.by_imsi.get(imsi)
+                if rec is not None:
+                    self._show(rec, "mme", ts, "previous held S1 already gone")
+                return
+            rec = self.by_imsi.get(imsi)
+            if rec is None:
+                return
+            if name == "Authentication ignored":
+                rec.nas = "auth-ignored"
+                self._show(rec, "mme", ts, "Authentication ignored, connection held")
+            elif name == "Discard Detach":
+                rec.nas = "detach-discarded"
+                self._show(rec, "mme", ts, "Detach discarded, S1 still held")
+            elif name == "Attach reject":
+                rec.nas = "attach-reject"
+                self._show(rec, "mme", ts, "Attach reject")
+            return
+
+        if RE_MME_IMPLICIT.search(line):
+            self.pending = ("implicit", None)
+            return
+        release = RE_MME_RELEASE.search(line)
+        if release:
+            self.pending = ("release", release.group(1))
+            return
+
+        named = RE_NAMED_ATTACH.search(line)
+        if named and named.group(1) == self.imsi:
+            rec = self.by_imsi.get(self.imsi)
+            if rec is not None:
+                if rec.nas != "auth-ignored":
+                    rec.nas = "attach"
+                self._show(rec, "mme", ts, "Attach request")
+            return
+        if RE_ATTACH_EMPTY.search(line):
+            rec = self._current_unbound()
+            if rec is not None and rec.imsi in (None, self.imsi):
+                rec.nas = "attach"
+                self._show(rec, "mme", ts, "Attach request")
+            return
+        imsi_line = RE_IMSI_LINE.search(line)
+        if imsi_line and not RE_RETX.search(line) and not RE_GUTI_IMSI.search(line):
+            imsi = imsi_line.group(1)
+            rec = self._current_unbound() or self.by_imsi.get(imsi)
+            if rec is None or rec.imsi not in (None, imsi):
+                return
+            # known/unknown UE already printed this IMSI. This line is
+            # the first identification only when that line was absent.
+            if rec.imsi == imsi:
+                return
+            rec.imsi = imsi
+            if rec.enb_id is not None:
+                self.by_enb[rec.enb_id] = rec
+            self.by_imsi[imsi] = rec
+            if rec.nas == "-":
+                rec.nas = "attach"
+            self._show(rec, "mme", ts, f"IMSI {imsi}")
+
+    def _enb(self, enb_id: int) -> UeRec:
+        rec = self.by_enb.get(enb_id)
+        if rec is None:
+            rec = UeRec()
+            rec.enb_id = enb_id
+            self.by_enb[enb_id] = rec
+        return rec
+
+    def _fresh_enb(self, enb_id: int) -> UeRec:
+        rec = self.by_enb.get(enb_id)
+        if rec is not None and rec.rrc == "released":
+            rec = None
+        if rec is None or rec.s1 in ("left-enb", "ue-removed", "expired",
+                                     "s1-removed", "link-down"):
+            rec = UeRec()
+            rec.enb_id = enb_id
+            self.by_enb[enb_id] = rec
+        return rec
+
+    def _current_unbound(self) -> UeRec | None:
+        if self.active is not None and self.active.imsi is None:
+            return self.active
+        fresh = [rec for rec in self.by_enb.values()
+                 if rec.imsi is None and rec.s1 in ("initial", "associated", "-")]
+        if not fresh:
+            return None
+        return fresh[-1]
+
+    def _watched(self) -> list[UeRec]:
+        return [rec for rec in self.by_enb.values() if rec.imsi == self.imsi]
+
+    def _show(self, rec: UeRec, side: str, ts: str, event: str) -> None:
+        if side == "enb":
+            rec.enb_ts = ts
+            rec.enb_event = event
+        else:
+            rec.mme_ts = ts
+            rec.mme_event = event
+        if rec.imsi != self.imsi:
+            return
+        enb = "-" if rec.enb_id is None else str(rec.enb_id)
+        mme = "-" if rec.mme_id is None else str(rec.mme_id)
+        tac = "-" if rec.tac is None else str(rec.tac)
+        cell = rec.cell or "-"
+        print(
+            f"[UE] {ts}  IMSI {rec.imsi}  "
+            f"eNB-UE {enb}  MME-UE {mme}  TAC {tac}  CI {cell}\n"
+            f"     {rec.phase()}\n"
+            f"     RRC {rec.rrc}   S1 {rec.s1}   NAS {rec.nas}\n"
+            f"     eNB {rec.enb_ts}  {rec.enb_event}\n"
+            f"     MME {rec.mme_ts}  {rec.mme_event}"
+            f"{self._rx_line(rec)}",
+            flush=True,
+        )
+
+    def on_phy(self, msg: dict) -> None:
+        """Take UL PUSCH HARQ lines for the watched UE out of a log_get reply."""
+        rec = self.by_imsi.get(self.imsi)
+        if rec is None or rec.enb_id is None:
+            return
+        if self._rx_enb != rec.enb_id:
+            self._rx_bucket.clear()
+            self._rx_enb = rec.enb_id
+        for entry in msg.get("logs") or []:
+            if entry.get("channel") != "PUSCH" or entry.get("dir") not in (None, "UL"):
+                continue
+            if entry.get("ue_id") != rec.enb_id:
+                continue
+            data = entry.get("data") or []
+            text = data if isinstance(data, str) else " ".join(data)
+            sample = parse_pusch(text)
+            if sample is None:
+                continue
+            sample["rnti"] = entry.get("rnti")
+            sample["ts"] = phy_clock(entry.get("timestamp"))
+            self._rx_bucket.append(sample)
+        if not self._rx_bucket:
+            return
+        good = [sample for sample in self._rx_bucket if sample["crc"] == "OK"]
+        latest = (good or self._rx_bucket)[-1]
+        rec.rx_level = latest["rx"]
+        rec.rx_epre = latest["epre"]
+        rec.rx_prb = f"{latest['prb_start']}:{latest['n_prb']}"
+        rec.rx_ta = latest["ta"]
+        rec.rx_snr = latest["snr"]
+        rec.rx_harq = latest["harq"]
+        now = time.monotonic()
+        if now - self._rx_print_at < RX_PRINT_EVERY:
+            return
+        self._print_rx(rec)
+        self._rx_bucket.clear()
+        self._rx_print_at = now
+
+    def _print_rx(self, rec: UeRec) -> None:
+        samples = self._rx_bucket
+        ok = [sample for sample in samples if sample["crc"] == "OK"]
+        good = ok or samples
+        latest = good[-1]
+        mean_rx = sum(sample["rx"] for sample in good) / len(good)
+        rnti = latest["rnti"]
+        rnti_text = "-" if rnti is None else str(rnti)
+        print(
+            f"[RX] {latest['ts']}  IMSI {rec.imsi}  eNB-UE {rec.enb_id}  "
+            f"rnti {rnti_text}  harq {latest['harq']}  "
+            f"prb {latest['prb_start']}:{latest['n_prb']}  "
+            f"symb {latest['symb_start']}:{latest['n_symb']}  "
+            f"epre {latest['epre']:.1f} dBm  ta {latest['ta']:.1f}  "
+            f"snr {latest['snr']:.1f} dB  crc {latest['crc']}  "
+            f"rx_level {latest['rx']:.1f} dBm  "
+            f"({len(samples)} PUSCH, {len(ok)} crc OK, mean {mean_rx:.1f})",
+            flush=True,
+        )
+
+    @staticmethod
+    def _rx_line(rec: UeRec) -> str:
+        if rec.rx_level is None:
+            return ""
+        return (
+            f"\n     RX epre {rec.rx_epre:.1f} dBm  prb {rec.rx_prb}  "
+            f"ta {rec.rx_ta:.1f}  snr {rec.rx_snr:.1f} dB  "
+            f"harq {rec.rx_harq}  rx_level {rec.rx_level:.1f} dBm"
+        )
+
 # Attach lines share one timestamp. The follow-up Served TAI lines arrive
 # a few seconds after the MME-UE removal, so that sequence gets longer.
 PAIR_TIMEOUT = 5.0
@@ -182,6 +728,21 @@ def which_config(cell: dict) -> int | None:
     return None
 
 
+def enb_log_path(explicit: str | None) -> str | None:
+    if explicit:
+        return explicit
+    env = os.environ.get("AMARISOFT_ENB_LOG", "").strip()
+    if env:
+        return env
+    for path in (
+        "/home/cerflux/amarisoft/www/live/enb0.log",
+        "/home/cerflux/amarisoft/ltewww-2025-12-12/live/enb0.log",
+    ):
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def mme_log_path() -> str:
     # Same-container Open5GS (sigsence-epc:open5gs) writes the MME log here.
     env = os.environ.get("OPEN5GS_MME_LOG", "").strip()
@@ -216,9 +777,36 @@ async def send_and_recv(ws, payload: dict, counter: list,
     return None
 
 
+async def tail_enb(path: str, ue_map: UeMap) -> None:
+    log_file = open(path, "r", errors="replace")
+    log_file.seek(0, os.SEEK_END)
+    pending = ""
+    try:
+        while True:
+            try:
+                size = os.fstat(log_file.fileno()).st_size
+                if size < log_file.tell():
+                    log_file.seek(0)
+            except OSError:
+                pass
+            chunk = log_file.read(262144)
+            if not chunk:
+                await asyncio.sleep(0.02)
+                continue
+            pending += chunk
+            while "\n" in pending:
+                raw, pending = pending.split("\n", 1)
+                if ("[RRC]" not in raw and "[NAS]" not in raw
+                        and "[S1AP]" not in raw):
+                    continue
+                ue_map.on_enb(ANSI_RE.sub("", raw).rstrip())
+    finally:
+        log_file.close()
+
+
 async def run(imsi: str, host: str, port: int, password: str | None,
               mode: str = "timer", interval: float = 10.0,
-              verbose: bool = False):
+              verbose: bool = False, enb_log: str | None = None):
     url = f"ws://{host}:{port}/"
     counter = [0]
 
@@ -228,6 +816,7 @@ async def run(imsi: str, host: str, port: int, password: str | None,
 
     print(f"[INFO] Connecting to eNB at {url}", flush=True)
     ws_box = [None]
+    ue_map_box = [None]
     drain_task = None
 
     async def handshake(sock) -> bool:
@@ -273,7 +862,8 @@ async def run(imsi: str, host: str, port: int, password: str | None,
         while True:
             try:
                 sock = await websockets.connect(
-                    url, additional_headers={"origin": "Test"}
+                    url, additional_headers={"origin": "Test"},
+                    max_size=8 * 1024 * 1024,
                 )
                 if await handshake(sock):
                     return sock
@@ -295,6 +885,15 @@ async def run(imsi: str, host: str, port: int, password: str | None,
             try:
                 async for raw_msg in sock:
                     msg = json.loads(raw_msg)
+                    if msg.get("message") == "log_get":
+                        ue_map = ue_map_box[0]
+                        if ue_map is not None:
+                            try:
+                                ue_map.on_phy(msg)
+                            except Exception as exc:
+                                print(f"[WARN]  PHY log parse failed: {exc}",
+                                      flush=True)
+                        continue
                     err = msg.get("error")
                     if err:
                         print(f"[ERROR] {err}", flush=True)
@@ -347,6 +946,11 @@ async def run(imsi: str, host: str, port: int, password: str | None,
     await start_drain(ws_box[0])
 
     log_path = mme_log_path()
+    enb_path = enb_log_path(enb_log)
+    ue_map = UeMap(imsi)
+    ue_map_box[0] = ue_map
+    enb_task = None
+    phy_task = None
     print(f"\n[INFO] Watching IMSI : {imsi}", flush=True)
     print(f"[INFO] Mode          : {mode}", flush=True)
     print("[INFO] Marker        : known UE by IMSI, "
@@ -362,11 +966,43 @@ async def run(imsi: str, host: str, port: int, password: str | None,
         print(f"[INFO] Interval      : first switch immediately on attach, "
               f"then every {interval:g}s",
               flush=True)
-    print(f"[INFO] Tailing       : {log_path}\n", flush=True)
+    print(f"[INFO] Tailing MME   : {log_path}", flush=True)
+    if enb_path:
+        print(f"[INFO] Tailing eNB   : {enb_path}", flush=True)
+        print("[INFO] UE map        : eNB UE id joined to MME S1AP ids",
+              flush=True)
+    else:
+        print("[WARN]  Amarisoft eNB log not found. "
+              "UE map will follow the MME log only.", flush=True)
+    print("[INFO] RX level      : PUSCH epre + 10*log10(n_prb * 12) "
+          "from log_get phy.level=debug\n",
+          flush=True)
 
     log_file = open(log_path, "r", errors="replace")
     log_file.seek(0, os.SEEK_END)
     pending = ""
+    if enb_path:
+        enb_task = asyncio.create_task(tail_enb(enb_path, ue_map))
+
+    async def poll_phy() -> None:
+        while True:
+            sock = ws_box[0]
+            if sock is None:
+                await asyncio.sleep(PHY_POLL_EVERY)
+                continue
+            payload = {
+                "message": "log_get",
+                "log_options": "phy.level=debug",
+                "message_id": make_id(counter),
+            }
+            try:
+                await sock.send(json.dumps(payload))
+            except (websockets.exceptions.ConnectionClosed, OSError):
+                await asyncio.sleep(1.0)
+                continue
+            await asyncio.sleep(PHY_POLL_EVERY)
+
+    phy_task = asyncio.create_task(poll_phy())
 
     # Open [] Attach request, waiting for IMSI[digits]. Unknown IMSI
     # and Identity response are optional lines in between.
@@ -461,6 +1097,7 @@ async def run(imsi: str, host: str, port: int, password: str | None,
             line = ANSI_RE.sub("", raw_line).rstrip()
             if not line:
                 continue
+            ue_map.on_mme(line)
             now = time.monotonic()
 
             if attach_seq and now - attach_seq["t0"] > PAIR_TIMEOUT:
@@ -616,6 +1253,10 @@ async def run(imsi: str, host: str, port: int, password: str | None,
     finally:
         if timer_task:
             timer_task.cancel()
+        if enb_task and not enb_task.done():
+            enb_task.cancel()
+        if phy_task and not phy_task.done():
+            phy_task.cancel()
         if drain_task and not drain_task.done():
             drain_task.cancel()
         if ws_box[0] is not None:
@@ -646,13 +1287,16 @@ def main():
                         help="eNB WebSocket port (default: 9001)")
     parser.add_argument("-p", "--password", default=None,
                         help="Password for WebSocket authentication")
+    parser.add_argument("--enb-log", default=None,
+                        help="Amarisoft eNB log to join with the MME "
+                             "(default: the live enb0.log)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Print half-open pairs while waiting for the second line")
     args = parser.parse_args()
 
     try:
         asyncio.run(run(args.imsi, args.host, args.port, args.password,
-                        args.mode, args.interval, args.verbose))
+                        args.mode, args.interval, args.verbose, args.enb_log))
     except KeyboardInterrupt:
         print("\n[INFO] Stopped by user.")
     except ConnectionRefusedError:
